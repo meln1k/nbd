@@ -25,6 +25,8 @@ import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -41,6 +43,8 @@ public class NBDVolumeServer implements Runnable {
   private final DataOutputStream out;
   private final String exportName;
   private final Storage storage;
+  private static final ExecutorService es = Executors.newFixedThreadPool(64, r -> new Thread(r, "fdb-volume-server"));
+
 
   public NBDVolumeServer(String exportName, DataInputStream in, DataOutputStream out) throws IOException {
     this.exportName = exportName;
@@ -85,8 +89,8 @@ public class NBDVolumeServer implements Runnable {
         switch (requestType) {
           case READ: {
             byte[] buffer = new byte[requestLength.intValue()];
-            log.info("Reading " + buffer.length + " from " + offset);
-            storage.read(buffer, offset.intValue()).thenApply($ -> {
+            log.fine("Reading " + buffer.length + " from " + offset);
+            storage.read(buffer, offset.longValue()).thenApplyAsync($ -> {
               synchronized (out) {
                 try {
                   out.write(NBD_REPLY_MAGIC_BYTES);
@@ -99,21 +103,21 @@ public class NBDVolumeServer implements Runnable {
                 }
               }
               return null;
-            });
+            }, es);
             break;
           }
           case WRITE: {
             byte[] buffer = new byte[requestLength.intValue()];
             in.readFully(buffer);
-            log.info("Writing " + buffer.length + " to " + offset);
-            storage.write(buffer, offset.intValue()).thenApply($ -> {
+            log.fine("Writing " + buffer.length + " to " + offset);
+            storage.write(buffer, offset.longValue()).thenApplyAsync($ -> {
               try {
                 writeReplyHeaderAndFlush(handle);
               } catch (IOException e) {
                 throw new RuntimeException(e);
               }
               return null;
-            });
+            }, es);
             break;
           }
           case DISCONNECT:
@@ -121,7 +125,7 @@ public class NBDVolumeServer implements Runnable {
             storage.disconnect();
             return;
           case FLUSH:
-            log.info("Flushing");
+            log.fine("Flushing");
             long start = System.currentTimeMillis();
             storage.flush().thenApply($ -> {
               try {
@@ -129,7 +133,7 @@ public class NBDVolumeServer implements Runnable {
               } catch (IOException e) {
                 throw new RuntimeException(e);
               }
-              log.info("Flush complete: " + (System.currentTimeMillis() - start) + "ms");
+              log.fine("Flush complete: " + (System.currentTimeMillis() - start) + "ms");
               return null;
             });
             break;

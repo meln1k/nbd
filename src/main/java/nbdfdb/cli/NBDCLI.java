@@ -24,7 +24,6 @@ public class NBDCLI {
   enum CommandType {
     CREATE(new CreateCommand()),
     DELETE(new DeleteCommand()),
-    SNAPSHOT(new SnapshotCommand()),
     LIST(new ListCommand()),
     SERVER(new ServerCommand()),
     ;

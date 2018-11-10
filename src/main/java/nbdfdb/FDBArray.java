@@ -29,6 +29,8 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.function.Function;
 
 import static java.util.Arrays.asList;
@@ -56,13 +58,14 @@ public class FDBArray {
   private final DirectorySubspace data;
   private final Database database;
   private final int blockSize;
-  private final FDBArray parentArray;
   private final DirectorySubspace ds;
-  private final Long snapshot;
   private final FDBBitSet usedBlocks;
 
   // Keys
   private byte[] dependents;
+
+  private static final ExecutorService es = Executors.newFixedThreadPool(64, r -> new Thread(r, "fdbarray"));
+
 
   // Used for copies
   private final ThreadLocal<byte[]> buffer = new ThreadLocal<byte[]>() {
@@ -77,26 +80,15 @@ public class FDBArray {
     return new FDBArray(database, ds);
   }
 
-  public static FDBArray open(Database database, String name, long timestamp) {
-    DirectorySubspace ds = get(dl.open(database, asList("com.sampullara.fdb.array", name)));
-    return new FDBArray(database, ds, timestamp);
-  }
 
   public static FDBArray create(Database database, String name, int blockSize) {
     DirectorySubspace ds = get(dl.create(database, asList("com.sampullara.fdb.array", name)));
-    return create(database, ds, blockSize, null, 0);
+    return create(database, ds, blockSize);
   }
 
-  protected static FDBArray create(Database database, DirectorySubspace ds, int blockSize, DirectorySubspace parent, long timestamp) {
+  protected static FDBArray create(Database database, DirectorySubspace ds, int blockSize) {
     DirectorySubspace metadata = get(ds.create(database, singletonList("metadata")));
-    if (parent != null) {
-      List<String> parentPath = parent.getPath();
-      database.run((Function<Transaction, Void>) tx -> {
-        tx.set(metadata.get(PARENT_KEY).pack(), Tuple.fromList(parentPath).pack());
-        tx.set(metadata.get(PARENT_TIMESTAMP_KEY).pack(), Tuple.from(timestamp).pack());
-        return null;
-      });
-    }
+
     database.run((Function<Transaction, Void>) tx -> {
       tx.set(metadata.get(BLOCK_SIZE_KEY).pack(), Ints.toByteArray(blockSize));
       return null;
@@ -112,9 +104,8 @@ public class FDBArray {
     }
   }
 
-  protected FDBArray(Database database, DirectorySubspace ds, Long snapshot) {
+  protected FDBArray(Database database, DirectorySubspace ds) {
     this.ds = ds;
-    this.snapshot = snapshot;
     this.database = database;
     this.metadata = get(ds.createOrOpen(database, singletonList("metadata")));
     this.data = get(ds.createOrOpen(database, singletonList("data")));
@@ -132,29 +123,12 @@ public class FDBArray {
     } else {
       blockSize = currentBlocksize;
     }
-    parentArray = database.run(tx -> {
-      byte[] parentPathValue = get(tx.get(metadata.get(PARENT_KEY).pack()));
-      byte[] parentTimestampBytes = get(tx.get(metadata.get(PARENT_TIMESTAMP_KEY).pack()));
-      if (parentPathValue == null) {
-        return null;
-      } else {
-        List<String> items = (List) Tuple.fromBytes(parentPathValue).getItems();
-        long parentTimestamp = Tuple.fromBytes(parentTimestampBytes).getLong(0);
-        return new FDBArray(database, get(DirectoryLayer.getDefault().open(database, items)), parentTimestamp);
-      }
-    });
     dependents = metadata.get(DEPENDENTS).pack();
     usedBlocks = new FDBBitSet(database, metadata.get(BLOCKS), 512);
   }
 
-  protected FDBArray(Database database, DirectorySubspace ds) {
-    this(database, ds, null);
-  }
 
   public CompletableFuture<Void> write(byte[] write, long offset) {
-    if (snapshot != null) {
-      throw new IllegalStateException("FDBArray is read only");
-    }
     return database.runAsync(tx -> {
       // Use a single buffer for all full blocksize writes
       byte[] bytes = buffer.get();
@@ -170,7 +144,7 @@ public class FDBArray {
       usedBlocks.set(firstBlock, lastBlock);
 
       // Special case first block and last block
-      byte[] firstBlockKey = data.get(firstBlock).get(System.currentTimeMillis()).pack();
+      byte[] firstBlockKey = data.get(firstBlock).pack();
       if (blockOffset > 0 || (blockOffset == 0 && length < blockSize)) {
         // Only need to do this if the first block is partial
         byte[] readBytes = new byte[blockSize];
@@ -187,7 +161,7 @@ public class FDBArray {
       if (lastBlock > firstBlock) {
         // For the blocks in the middle we can just blast values in without looking at the current bytes
         for (long i = firstBlock + 1; i < lastBlock; i++) {
-          byte[] key = data.get(i).get(System.currentTimeMillis()).pack();
+          byte[] key = data.get(i).pack();
           int writeBlock = (int) (i - firstBlock);
           int position = (writeBlock - 1) * blockSize + shift;
           System.arraycopy(write, position, bytes, 0, blockSize);
@@ -195,7 +169,7 @@ public class FDBArray {
         }
         int position = (int) ((lastBlock - firstBlock - 1) * blockSize + shift);
         int lastBlockLength = length - position;
-        byte[] lastBlockKey = data.get(lastBlock).get(System.currentTimeMillis()).pack();
+        byte[] lastBlockKey = data.get(lastBlock).pack();
         // If the last block is a complete block we don't need to read
         if (lastBlockLength == blockSize) {
           System.arraycopy(write, position, bytes, 0, blockSize);
@@ -208,7 +182,7 @@ public class FDBArray {
         }
       }
       return CompletableFuture.completedFuture(null);
-    });
+    }, es);
   }
 
   public CompletableFuture<Long> usage() {
@@ -238,7 +212,7 @@ public class FDBArray {
     return database.runAsync(tx -> {
       read(tx, offset, read, timestamp, null);
       return CompletableFuture.completedFuture(null);
-    });
+    }, es);
   }
 
   static class BlocksRead {
@@ -260,17 +234,18 @@ public class FDBArray {
   }
 
   private void read(ReadTransaction tx, long offset, byte[] read, long readTimestamp, BlocksRead blocksRead) {
-    long snapshotTimestamp = snapshot == null ? readTimestamp : Math.min(readTimestamp, snapshot);
     long firstBlock = offset / blockSize;
     int blockOffset = (int) (offset % blockSize);
     int length = read.length;
     long lastBlock = (offset + length) / blockSize;
     long currentBlockId = -1;
     byte[] currentValue = null;
-    if (parentArray != null && blocksRead == null) {
+    if (blocksRead == null) {
       blocksRead = new BlocksRead((int) (lastBlock - firstBlock + 1));
     }
-    for (KeyValue keyValue : tx.getRange(data.get(firstBlock).pack(), data.get(lastBlock + 1).pack())) {
+    List<KeyValue> range =  get(tx.getRange(data.get(firstBlock).pack(), data.get(lastBlock + 1).pack()).asList());
+
+    for (KeyValue keyValue : range) {
       Tuple keyTuple = data.unpack(keyValue.getKey());
       long blockId = keyTuple.getLong(0);
       if (blockId != currentBlockId && currentBlockId != -1) {
@@ -281,18 +256,13 @@ public class FDBArray {
       // Advance the current block id
       currentBlockId = blockId;
       // Update the current value with the latest value not written after the snapshot timestamp
-      long timestamp = keyTuple.getLong(1);
-      if (timestamp <= snapshotTimestamp) {
+//      long timestamp = keyTuple.getLong(1);
+//      if (timestamp <= snapshotTimestamp) {
         currentValue = keyValue.getValue();
-      }
+//      }
     }
     copy(read, firstBlock, blockOffset, lastBlock, currentValue, currentBlockId, blocksRead);
-    if (parentArray != null && !blocksRead.done()) {
-      // This is currently less efficient than I would like. Basically you should do the other reads
-      // and only call the parent when there are gaps. Instead, we are calling all parents for
-      // all reads and that just scales poorly as you make a deeper hierarchy.
-      parentArray.read(tx, offset, read, snapshotTimestamp, blocksRead);
-    }
+
   }
 
   private void copy(byte[] read, long firstBlock, int blockOffset, long lastBlock, byte[] currentValue, long blockId, BlocksRead blocksRead) {
@@ -316,24 +286,6 @@ public class FDBArray {
     }
   }
 
-  public FDBArray snapshot() {
-    return snapshot(System.currentTimeMillis());
-  }
-
-  public FDBArray snapshot(long timestamp) {
-    return new FDBArray(database, ds, timestamp);
-  }
-
-  public FDBArray snapshot(String name) {
-    database.run(tx -> {
-      tx.mutate(MutationType.ADD, dependents, ONE);
-      return null;
-    });
-    List<String> childDirectory = asList("com.sampullara.fdb.array", name);
-    DirectorySubspace childDs = get(DirectoryLayer.getDefault().create(database, childDirectory));
-    FDBArray.create(database, childDs, blockSize, ds, System.currentTimeMillis());
-    return new FDBArray(database, childDs);
-  }
 
   public void clear() {
     database.run((Function<Transaction, Void>) tx -> {
@@ -343,24 +295,8 @@ public class FDBArray {
     });
   }
 
-  private void dependentDeleted() {
-    database.run(tx -> {
-      tx.mutate(MutationType.ADD, dependents, MINUS_ONE);
-      return null;
-    });
-  }
-
   public void delete() {
-    boolean deletable = database.run(tx -> {
-      byte[] bytes = get(tx.get(dependents));
-      return bytes == null || Longs.fromByteArray(bytes) == 0;
-    });
-    if (deletable) {
-      if (parentArray != null) parentArray.dependentDeleted();
-      get(ds.remove(database));
-    } else {
-      throw new IllegalStateException("Array still has dependents");
-    }
+    get(ds.remove(database));
   }
 
   public void setMetadata(byte[] key, byte[] value) {
@@ -372,6 +308,6 @@ public class FDBArray {
 
   public byte[] getMetadata(byte[] key) {
     byte[] value = database.run(tx -> get(tx.get(metadata.get(key).pack())));
-    return value == null ? parentArray == null ? null : parentArray.getMetadata(key) : value;
+    return value;
   }
 }

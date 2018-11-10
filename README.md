@@ -2,6 +2,7 @@ License
 =======
 
 Copyright 2018 Sam Pullara
+Copyright 2018 Nikita Melkozerov
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -24,7 +25,7 @@ FoundationDB. This gives you a highly scalable, high performance, reliable block
 you can then format and put a filesystem on it.
 
 The NBDCLI command allows you to create new volume, list the volumes you have in your system,
-delete a volume or snapshot a current volume to another volume.
+or delete a volume.
 
 HOWTO
 =====
