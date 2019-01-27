@@ -22,16 +22,14 @@ import com.apple.foundationdb.directory.DirectoryLayer;
 import com.apple.foundationdb.directory.DirectorySubspace;
 import com.apple.foundationdb.tuple.Tuple;
 import com.google.common.primitives.Ints;
-import com.google.common.primitives.Longs;
 
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.function.Function;
+import java.util.logging.Logger;
 
 import static java.util.Arrays.asList;
 import static java.util.Collections.singletonList;
@@ -41,6 +39,10 @@ import static java.util.Collections.singletonList;
  */
 public class FDBArray {
 
+
+  private final Logger log;
+
+
   // FDB
   private static final byte[] ONE = new byte[]{0, 0, 0, 0, 0, 0, 0, 1};
   private static final byte[] MINUS_ONE = new byte[]{0, 0, 0, 0, 0, 0, 0, -1};
@@ -48,9 +50,6 @@ public class FDBArray {
 
   // Metadata keys
   private static final String BLOCK_SIZE_KEY = "block_size";
-  private static final String PARENT_KEY = "parent";
-  private static final String PARENT_TIMESTAMP_KEY = "parent_timestamp";
-  private static final String DEPENDENTS = "dependents";
   private static final String BLOCKS = "blocks";
 
   // Location in the database
@@ -61,8 +60,8 @@ public class FDBArray {
   private final DirectorySubspace ds;
   private final FDBBitSet usedBlocks;
 
-  // Keys
-  private byte[] dependents;
+  // Other constants
+  private final int WRITE_GROUP_SIZE = 4;
 
   private static final ExecutorService es = Executors.newFixedThreadPool(64, r -> new Thread(r, "fdbarray"));
 
@@ -105,6 +104,7 @@ public class FDBArray {
   }
 
   protected FDBArray(Database database, DirectorySubspace ds) {
+    log = Logger.getLogger("FDBArray");
     this.ds = ds;
     this.database = database;
     this.metadata = get(ds.createOrOpen(database, singletonList("metadata")));
@@ -123,66 +123,155 @@ public class FDBArray {
     } else {
       blockSize = currentBlocksize;
     }
-    dependents = metadata.get(DEPENDENTS).pack();
     usedBlocks = new FDBBitSet(database, metadata.get(BLOCKS), 512);
+  }
+
+  private Boolean notAligned(int blockOffset, int length, int lastBlockLength) {
+    return blockOffset > 0 || (blockOffset == 0 && length < blockSize) || (lastBlockLength != 0 && lastBlockLength != blockSize);
   }
 
 
   public CompletableFuture<Void> write(byte[] write, long offset) {
-    return database.runAsync(tx -> {
-      // Use a single buffer for all full blocksize writes
-      byte[] bytes = buffer.get();
+    // Calculate the block locations
+    int length = write.length;
+    long firstBlock = offset / blockSize;
+    long lastBlock = (offset + length) / blockSize;
+    int blockOffset = (int) (offset % blockSize);
+    int shift = blockSize - blockOffset;
 
-      // Calculate the block locations
-      int length = write.length;
-      long firstBlock = offset / blockSize;
-      long lastBlock = (offset + length) / blockSize;
-      int blockOffset = (int) (offset % blockSize);
-      int shift = blockSize - blockOffset;
+    int lastBlockPosition = (int) ((lastBlock - firstBlock - 1) * blockSize + shift);
+    int lastBlockLength = length - lastBlockPosition;
 
-      // Track where we have written so we can estimate usage later
-      usedBlocks.set(firstBlock, lastBlock);
+    // Track where we have written so we can estimate usage later
+    usedBlocks.set(firstBlock, lastBlock);
 
-      // Special case first block and last block
-      byte[] firstBlockKey = data.get(firstBlock).pack();
-      if (blockOffset > 0 || (blockOffset == 0 && length < blockSize)) {
-        // Only need to do this if the first block is partial
-        byte[] readBytes = new byte[blockSize];
-        read(tx, firstBlock * blockSize, readBytes, Long.MAX_VALUE, null);
-        int writeLength = Math.min(length, shift);
-        System.arraycopy(write, 0, readBytes, blockOffset, writeLength);
-        tx.set(firstBlockKey, readBytes);
-      } else {
-        // In this case copy the full first block blindly
-        System.arraycopy(write, 0, bytes, 0, blockSize);
-        tx.set(firstBlockKey, bytes);
-      }
+    if (notAligned(blockOffset, length, lastBlockLength)) {
+      log.warning("Non-aligned write!");
+      CompletableFuture<Void> firstBlockFuture = database.runAsync(tx -> {
+        // Use a single buffer for all full blocksize writes
+        byte[] bytes = buffer.get();
+
+
+        // Special case first block and last block
+        byte[] firstBlockKey = data.get(firstBlock).pack();
+        if (blockOffset > 0 || (blockOffset == 0 && length < blockSize)) {
+          // Only need to do this if the first block is partial
+          byte[] readBytes = new byte[blockSize];
+          read(tx, firstBlock * blockSize, readBytes, null);
+          int writeLength = Math.min(length, shift);
+          System.arraycopy(write, 0, readBytes, blockOffset, writeLength);
+          tx.set(firstBlockKey, readBytes);
+        } else {
+          // In this case copy the full first block blindly
+          System.arraycopy(write, 0, bytes, 0, blockSize);
+          tx.set(firstBlockKey, bytes);
+        }
+        return CompletableFuture.completedFuture(null);
+      }, es);
+
       // If there is more than one block
       if (lastBlock > firstBlock) {
         // For the blocks in the middle we can just blast values in without looking at the current bytes
-        for (long i = firstBlock + 1; i < lastBlock; i++) {
-          byte[] key = data.get(i).pack();
+
+        CompletableFuture<Void> middleWrites = writeAligned(write, firstBlock, firstBlock + 1, lastBlock, shift);
+
+        CompletableFuture<Void> lastBlockFuture = database.runAsync(tx -> {
+
+          byte[] bytes = buffer.get();
+
+          byte[] lastBlockKey = data.get(lastBlock).pack();
+          // If the last block is a complete block we don't need to read
+          if (lastBlockLength == blockSize) {
+            System.arraycopy(write, lastBlockPosition, bytes, 0, blockSize);
+            tx.set(lastBlockKey, bytes);
+          } else {
+            byte[] readBytes = new byte[blockSize];
+            read(tx, lastBlock * blockSize, readBytes, null);
+            System.arraycopy(write, lastBlockPosition, readBytes, 0, lastBlockLength);
+            tx.set(lastBlockKey, readBytes);
+          }
+          return CompletableFuture.completedFuture(null);
+
+        }, es);
+
+        return CompletableFuture.allOf(firstBlockFuture, middleWrites, lastBlockFuture);
+
+      } else {
+        return firstBlockFuture;
+      }
+
+
+      } else {
+        return writeAligned(write, firstBlock, firstBlock, lastBlock, shift);
+
+      }
+
+  }
+
+  /**
+   * Performs an aligned write in group of 4 blocks. Blocks MUST be aligned!
+   *
+   * @param write array to copy data from
+   * @param startBlock start block
+   * @param endBlock end block (exclusive)
+   * @return
+   */
+  private CompletableFuture<Void> writeAligned(byte[] write, long firstBlock, long startBlock, long endBlock, int shift) {
+
+    long totalBlocksToWrite = (endBlock - startBlock);
+    int completeGroups = (int)(totalBlocksToWrite / WRITE_GROUP_SIZE);
+    long lastGroupSize = totalBlocksToWrite % WRITE_GROUP_SIZE;
+    boolean incompleteLastGroup = lastGroupSize != 0;
+
+    int futuresSize = completeGroups;
+    if (incompleteLastGroup) {
+      futuresSize++;
+    }
+
+    List<CompletableFuture<Void>> futures = new ArrayList<>(futuresSize);
+
+
+    // start all writes in a group size
+
+
+    for (long groupPosition = startBlock; groupPosition < startBlock + completeGroups * WRITE_GROUP_SIZE; groupPosition += WRITE_GROUP_SIZE) {
+      final long currentGroupPosition = groupPosition;
+      CompletableFuture<Void> writeResult = database.runAsync(tx -> {
+        byte[] bytes = buffer.get();
+        for (long i = currentGroupPosition; i < currentGroupPosition + WRITE_GROUP_SIZE; i++) {
+          byte[] key = data.pack(i);
           int writeBlock = (int) (i - firstBlock);
           int position = (writeBlock - 1) * blockSize + shift;
           System.arraycopy(write, position, bytes, 0, blockSize);
           tx.set(key, bytes);
         }
-        int position = (int) ((lastBlock - firstBlock - 1) * blockSize + shift);
-        int lastBlockLength = length - position;
-        byte[] lastBlockKey = data.get(lastBlock).pack();
-        // If the last block is a complete block we don't need to read
-        if (lastBlockLength == blockSize) {
+        return CompletableFuture.completedFuture(null);
+      }, es);
+
+      futures.add(writeResult);
+    }
+
+
+
+    if (incompleteLastGroup) {
+      CompletableFuture<Void> writeResult = database.runAsync(tx -> {
+        byte[] bytes = buffer.get();
+        for (long i = startBlock + completeGroups * WRITE_GROUP_SIZE; i < endBlock; i++) {
+          byte[] key = data.pack(i);
+          int writeBlock = (int) (i - firstBlock);
+          int position = (writeBlock - 1) * blockSize + shift;
           System.arraycopy(write, position, bytes, 0, blockSize);
-          tx.set(lastBlockKey, bytes);
-        } else {
-          byte[] readBytes = new byte[blockSize];
-          read(tx, lastBlock * blockSize, readBytes, Long.MAX_VALUE, null);
-          System.arraycopy(write, position, readBytes, 0, lastBlockLength);
-          tx.set(lastBlockKey, readBytes);
+          tx.set(key, bytes);
         }
-      }
-      return CompletableFuture.completedFuture(null);
-    }, es);
+        return CompletableFuture.completedFuture(null);
+      }, es);
+
+      futures.add(writeResult);
+    }
+
+
+
+    return CompletableFuture.allOf(futures.toArray(new CompletableFuture[futuresSize]));
   }
 
   public CompletableFuture<Long> usage() {
@@ -197,20 +286,8 @@ public class FDBArray {
    * @return
    */
   public CompletableFuture<Void> read(byte[] read, long offset) {
-    return read(read, offset, Long.MAX_VALUE);
-  }
-
-  /**
-   * Read blocks as of a particular timestamp.
-   *
-   * @param read
-   * @param offset
-   * @param timestamp
-   * @return
-   */
-  public CompletableFuture<Void> read(byte[] read, long offset, long timestamp) {
     return database.runAsync(tx -> {
-      read(tx, offset, read, timestamp, null);
+      read(tx, offset, read, null);
       return CompletableFuture.completedFuture(null);
     }, es);
   }
@@ -233,7 +310,7 @@ public class FDBArray {
     }
   }
 
-  private void read(ReadTransaction tx, long offset, byte[] read, long readTimestamp, BlocksRead blocksRead) {
+  private void read(ReadTransaction tx, long offset, byte[] read, BlocksRead blocksRead) {
     long firstBlock = offset / blockSize;
     int blockOffset = (int) (offset % blockSize);
     int length = read.length;
@@ -256,10 +333,7 @@ public class FDBArray {
       // Advance the current block id
       currentBlockId = blockId;
       // Update the current value with the latest value not written after the snapshot timestamp
-//      long timestamp = keyTuple.getLong(1);
-//      if (timestamp <= snapshotTimestamp) {
-        currentValue = keyValue.getValue();
-//      }
+      currentValue = keyValue.getValue();
     }
     copy(read, firstBlock, blockOffset, lastBlock, currentValue, currentBlockId, blocksRead);
 

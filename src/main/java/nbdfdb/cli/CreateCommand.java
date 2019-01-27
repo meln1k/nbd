@@ -63,6 +63,7 @@ public class CreateCommand implements Runnable {
         Unit unit = Unit.valueOf(unitGroup.toUpperCase());
         value *= unit.factor;
       }
+      System.out.println("Creating volume " + exportName + " with size " + value + " " + unitGroup );
       FDBArray fdbArray = FDBArray.create(fdb.open(), exportName, blockSize);
       fdbArray.setMetadata(SIZE_KEY, Longs.toByteArray(value));
       System.out.println("Successfully created '" + exportName + "'");

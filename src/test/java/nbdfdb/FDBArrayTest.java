@@ -55,9 +55,9 @@ public class FDBArrayTest {
   }
 
   @Test
-  public void testSimpleReadWrite() throws ExecutionException, InterruptedException {
+  public void testNotAlignedReadWrite() throws ExecutionException, InterruptedException {
     byte[] bytes = new byte[12345];
-    Arrays.fill(bytes, (byte) 1);
+    Arrays.fill(bytes, (byte) 250);
     fdbArray.write(bytes, 10000).get();
     byte[] read = new byte[12345];
     fdbArray.read(read, 10000).get();
@@ -65,6 +65,17 @@ public class FDBArrayTest {
     assertEquals((12345 / 512 + 1) * 512, fdbArray.usage().get().longValue());
   }
 
+  @Test
+  public void testAlignedReadWrite() throws ExecutionException, InterruptedException {
+    byte[] bytes = new byte[8192];
+    Arrays.fill(bytes, (byte) 137);
+
+    fdbArray.write(bytes, 512).get();
+    byte[] read = new byte[8192];
+    fdbArray.read(read, 512).get();
+    assertArrayEquals(bytes, read);
+    assertEquals((8192 / 512 + 1) * 512, fdbArray.usage().get().longValue());
+  }
 
 
 
@@ -148,7 +159,8 @@ public class FDBArrayTest {
             " p50: " + h.getValueAtPercentile(50)/1e6 +
             " p95: " + h.getValueAtPercentile(95)/1e6 +
             " p99: " + h.getValueAtPercentile(99)/1e6 +
-            " p999: " + h.getValueAtPercentile(999)/1e6
+            " p999: " + h.getValueAtPercentile(999)/1e6 +
+            " max: " + h.getMaxValue()/1e6
     );
   }
 }
